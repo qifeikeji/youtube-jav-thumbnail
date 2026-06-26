@@ -88,7 +88,7 @@ function normalizeProxyConfig(raw) {
       socks5: { ...d.socks5, ...(raw.socks5 || {}) }
     };
     if (out.http.enabled && out.socks5.enabled) {
-      out.socks5.enabled = false;
+      out.http.enabled = false;
     }
     return out;
   }
@@ -156,6 +156,10 @@ function configForRenderer() {
   };
 }
 
+function socksProxyRule(hostPort) {
+  return `socks5h=${hostPort}`;
+}
+
 function proxyRulesFromEndpoint(endpoint, kind) {
   const ep = endpoint || {};
   const urlRaw = (ep.url || '').trim();
@@ -167,9 +171,13 @@ function proxyRulesFromEndpoint(endpoint, kind) {
     const defaultPort = kind === 'http' ? 8080 : 1080;
     const hostPort = `${ep.host}:${ep.port || defaultPort}`;
     if (kind === 'socks5') {
-      return `socks5=${hostPort}`;
+      return socksProxyRule(hostPort);
     }
     return `http=${hostPort};https=${hostPort}`;
+  }
+  if (ep.enabled && urlRaw) {
+    const fromUrl = proxyRulesFromUrl(urlRaw);
+    if (fromUrl) return fromUrl;
   }
   return '';
 }
@@ -189,6 +197,10 @@ function proxyRulesString() {
 function proxyRulesFromUrl(urlStr) {
   let normalized = urlStr.trim();
   if (!normalized) return '';
+  const socksDirect = normalized.match(/^socks5h?:\/\/(.+)$/i);
+  if (socksDirect) {
+    return socksProxyRule(socksDirect[1].replace(/\/$/, ''));
+  }
   if (!/^[a-z][a-z0-9+.-]*:/i.test(normalized)) {
     normalized = `http://${normalized}`;
   }
@@ -203,31 +215,52 @@ function proxyRulesFromUrl(urlStr) {
       else if (scheme === 'http') port = '80';
       else port = '1080';
     }
-    const hostPort = `${host}:${port}`;
-    if (scheme === 'socks5' || scheme === 'socks4') {
-      return `${scheme}=${hostPort}`;
+    let hostPort = `${host}:${port}`;
+    if (parsed.username) {
+      const user = decodeURIComponent(parsed.username);
+      const pass = parsed.password ? decodeURIComponent(parsed.password) : '';
+      hostPort = pass ? `${user}:${pass}@${hostPort}` : `${user}@${hostPort}`;
+    }
+    if (scheme === 'socks5' || scheme === 'socks5h') {
+      return socksProxyRule(hostPort);
+    }
+    if (scheme === 'socks4') {
+      return `socks4=${hostPort}`;
     }
     if (scheme === 'http' || scheme === 'https') {
       return `http=${hostPort};https=${hostPort}`;
     }
   } catch (_) {
-    return normalized.replace(/^https?:\/\//i, '');
+    /* fall through */
   }
   return '';
 }
 
-async function applyProxyToSession(sess) {
-  const rules = proxyRulesString();
-  if (rules) {
-    await sess.setProxy({ proxyRules: rules });
-  } else {
-    await sess.setProxy({ mode: 'direct' });
+const NET_HEADERS = {
+  'User-Agent':
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+  Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+  'Accept-Language': 'en-US,en;q=0.9'
+};
+
+function isLikelyValidImage(buf, minBytes) {
+  if (!buf || buf.length < (minBytes || 800)) return false;
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) {
+    return buf.length >= (minBytes || 2000);
   }
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
+    return buf.length >= (minBytes || 800);
+  }
+  return buf.length >= (minBytes || 1500);
 }
 
-function fetchUrlBuffer(url) {
+function fetchUrlBufferViaRequest(url, sess, extraHeaders) {
+  const headers = { ...NET_HEADERS, ...extraHeaders };
   return new Promise((resolve, reject) => {
-    const request = net.request({ url, session: session.defaultSession });
+    const request = net.request({ url, session: sess, useSessionCookies: true });
+    for (const [key, value] of Object.entries(headers)) {
+      request.setHeader(key, value);
+    }
     const chunks = [];
     request.on('response', (response) => {
       if (response.statusCode >= 400) {
@@ -241,6 +274,69 @@ function fetchUrlBuffer(url) {
     request.on('error', reject);
     request.end();
   });
+}
+
+async function fetchUrlBufferOnce(url, sess, extraHeaders) {
+  const headers = { ...NET_HEADERS, ...extraHeaders };
+  let lastErr;
+  try {
+    return await fetchUrlBufferViaRequest(url, sess, headers);
+  } catch (e) {
+    lastErr = e;
+  }
+  if (typeof net.fetch === 'function') {
+    try {
+      const response = await net.fetch(url, { session: sess, headers });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      return Buffer.from(await response.arrayBuffer());
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error('网络请求失败');
+}
+
+async function applyProxyRulesToSession(sess, rules) {
+  if (rules) {
+    await sess.setProxy({
+      mode: 'fixed_servers',
+      proxyRules: rules,
+      proxyBypassRules: '<local>'
+    });
+  } else {
+    await sess.setProxy({ mode: 'direct' });
+  }
+  if (typeof sess.closeAllConnections === 'function') {
+    sess.closeAllConnections();
+  }
+}
+
+async function applyProxyToSession(sess) {
+  await applyProxyRulesToSession(sess, proxyRulesString());
+}
+
+async function fetchUrlBuffer(url, extraHeaders) {
+  const sess = session.defaultSession;
+  await applyProxyToSession(sess);
+  const rules = proxyRulesString();
+  try {
+    return await fetchUrlBufferOnce(url, sess, extraHeaders);
+  } catch (firstErr) {
+    if (rules && rules.includes('socks5h=')) {
+      try {
+        const altRules = rules.replace(/socks5h=/g, 'socks5=');
+        await applyProxyRulesToSession(sess, altRules);
+        return await fetchUrlBufferOnce(url, sess, extraHeaders);
+      } catch (_) {
+        /* restore below */
+      } finally {
+        await applyProxyToSession(sess);
+      }
+    }
+    throw firstErr;
+  }
 }
 
 function getVideoId(url) {
@@ -314,19 +410,32 @@ function ensureDir(dir) {
 
 async function fetchYoutubeThumbnail(videoId) {
   const urls = [
+    `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`,
+    `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+    `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`,
+    `https://i.ytimg.com/vi/${videoId}/default.jpg`,
     `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg`,
     `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`,
     `https://img.youtube.com/vi/${videoId}/mqdefault.jpg`,
     `https://img.youtube.com/vi/${videoId}/default.jpg`
   ];
+  const ytHeaders = {
+    Referer: 'https://www.youtube.com/',
+    Origin: 'https://www.youtube.com'
+  };
+  let lastErr = null;
   for (const url of urls) {
     try {
-      const buf = await fetchUrlBuffer(url);
-      if (buf.length < 1000) continue;
+      const buf = await fetchUrlBuffer(url, ytHeaders);
+      const minSize = url.includes('maxresdefault') ? 3500 : 1200;
+      if (!isLikelyValidImage(buf, minSize)) continue;
       return { buffer: buf, url, kind: 'youtube', id: videoId };
-    } catch (_) {}
+    } catch (e) {
+      lastErr = e;
+    }
   }
-  throw new Error('无法加载 YouTube 缩略图');
+  const detail = lastErr && lastErr.message ? `（${lastErr.message}）` : '';
+  throw new Error(`无法加载 YouTube 缩略图${detail}。请检查网络或代理，并确认视频 ID：${videoId}`);
 }
 
 async function fetchJavCover(code) {
