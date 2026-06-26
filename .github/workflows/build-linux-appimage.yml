@@ -1,0 +1,43 @@
+name: Build Linux AppImage
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install AppImage build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libfuse2
+
+      - name: Resolve latest Electron version
+        id: electron
+        run: echo "version=$(npm view electron version)" >> "$GITHUB_OUTPUT"
+
+      - name: Install latest Electron and electron-builder
+        run: |
+          npm install --no-save "electron@${{ steps.electron.outputs.version }}" electron-builder@latest
+
+      - name: Build AppImage (Linux only)
+        run: npx electron-builder --linux AppImage --publish never
+
+      - name: Upload AppImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-appimage-electron-${{ steps.electron.outputs.version }}
+          path: dist/*.AppImage
+          if-no-files-found: error
+          retention-days: 90

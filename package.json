@@ -1,0 +1,30 @@
+{
+  "name": "youtube-jav-cover",
+  "version": "1.0.0",
+  "description": "YouTube + JAV 封面下载",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "dist:linux": "electron-builder --linux AppImage"
+  },
+  "build": {
+    "appId": "com.youtube.jav.cover",
+    "productName": "YouTubeJavCover",
+    "executableName": "youtube-jav-cover",
+    "files": [
+      "main.js",
+      "preload.js",
+      "index.html",
+      "renderer.js",
+      "styles.css",
+      "run.sh"
+    ],
+    "directories": {
+      "output": "dist"
+    },
+    "linux": {
+      "target": ["AppImage"],
+      "category": "Utility"
+    }
+  }
+}

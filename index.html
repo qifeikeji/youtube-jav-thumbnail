@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data: blob: file:; style-src 'self' 'unsafe-inline'; script-src 'self'" />
+  <title>YouTube + JAV 封面</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="toolbar">
+    <input id="searchInput" type="text" placeholder="YouTube 链接 / JAV 代号 / missav 链接" spellcheck="false" />
+    <button type="button" id="btnPaste" class="icon-btn" title="粘贴"><span class="btn-label">粘贴</span></button>
+    <button type="button" id="btnSearch" class="icon-btn primary" title="搜索"><span class="btn-label">搜索</span></button>
+    <button type="button" id="btnExtract" class="icon-btn" title="提纯代号 (JAV)"><span class="btn-label">提纯代号</span></button>
+    <button type="button" id="btnOpenJav" class="icon-btn" title="打开 JAV 封面目录"><span class="btn-label">JAV目录</span></button>
+    <button type="button" id="btnOpenYt" class="icon-btn" title="打开 YouTube 封面目录"><span class="btn-label">YT目录</span></button>
+    <button type="button" id="btnSettings" class="icon-btn" title="设置"><span class="btn-label">设置</span></button>
+  </header>
+
+  <p id="statusBar" class="status">就绪</p>
+
+  <main id="previewArea" class="preview-area">
+    <div id="placeholder" class="placeholder">
+      在上方输入 YouTube 链接或 JAV 代号，点击搜索<br />
+      右键缩略图可复制到剪贴板
+    </div>
+    <figure id="previewFigure" class="preview-figure hidden">
+      <img id="previewImg" alt="封面预览" draggable="true" />
+      <figcaption id="previewCaption"></figcaption>
+    </figure>
+  </main>
+
+  <div id="contextMenu" class="context-menu hidden">
+    <button type="button" data-action="copy">复制图片到剪贴板</button>
+  </div>
+
+  <dialog id="settingsDialog" class="settings-dialog">
+    <form method="dialog" id="settingsForm">
+      <h2>设置</h2>
+
+      <fieldset class="group">
+        <legend>代理设置</legend>
+        <p class="path-hint">HTTP 与 SOCKS5 只能勾选其一；都不勾选则直连</p>
+
+        <fieldset class="sub-group">
+          <legend class="sub-legend">
+            <label class="row-check inline-legend">
+              <input type="checkbox" id="proxyHttpEnabled" />
+              HTTP 代理
+            </label>
+          </legend>
+          <label class="row">
+            <span>主机</span>
+            <input type="text" id="proxyHttpHost" placeholder="127.0.0.1" />
+          </label>
+          <label class="row">
+            <span>端口</span>
+            <input type="number" id="proxyHttpPort" min="1" max="65535" value="8080" />
+          </label>
+          <label class="row">
+            <span>或 URL</span>
+            <input type="text" id="proxyHttpUrl" placeholder="http://127.0.0.1:8080（优先于主机/端口）" />
+          </label>
+        </fieldset>
+
+        <fieldset class="sub-group">
+          <legend class="sub-legend">
+            <label class="row-check inline-legend">
+              <input type="checkbox" id="proxySocks5Enabled" />
+              SOCKS5 代理
+            </label>
+          </legend>
+          <label class="row">
+            <span>主机</span>
+            <input type="text" id="proxySocks5Host" placeholder="127.0.0.1" />
+          </label>
+          <label class="row">
+            <span>端口</span>
+            <input type="number" id="proxySocks5Port" min="1" max="65535" value="1080" />
+          </label>
+          <label class="row">
+            <span>或 URL</span>
+            <input type="text" id="proxySocks5Url" placeholder="socks5://127.0.0.1:1080（优先于主机/端口）" />
+          </label>
+        </fieldset>
+      </fieldset>
+
+      <fieldset class="group">
+        <legend>主窗口</legend>
+        <label class="row-check">
+          <input type="checkbox" id="showMenuBar" checked />
+          显示菜单栏（File / Edit / View / Window）
+        </label>
+        <label class="row">
+          <span>标题</span>
+          <input type="text" id="winTitle" placeholder="YouTube + JAV 封面" />
+        </label>
+        <label class="row">
+          <span>宽度</span>
+          <input type="number" id="winWidth" min="400" max="10000" />
+        </label>
+        <label class="row">
+          <span>高度</span>
+          <input type="number" id="winHeight" min="300" max="10000" />
+        </label>
+      </fieldset>
+
+      <fieldset class="group">
+        <legend>设置窗口</legend>
+        <label class="row">
+          <span>宽度</span>
+          <input type="number" id="dlgWidth" min="320" max="2000" />
+        </label>
+        <label class="row">
+          <span>高度</span>
+          <input type="number" id="dlgHeight" min="240" max="2000" />
+        </label>
+      </fieldset>
+
+      <fieldset class="group">
+        <legend>保存路径</legend>
+        <p class="path-hint">留空时使用 Electron 配置目录（userData）下的 json / jav / youtube 子目录</p>
+        <label class="row">
+          <span>设置 JSON</span>
+          <input type="text" id="settingsJsonPath" placeholder="settings.json 完整路径" />
+          <button type="button" class="mini" data-paste-for="settingsJsonPath">粘贴</button>
+          <button type="button" class="mini" data-open-for="settingsJson">打开</button>
+        </label>
+        <label class="row">
+          <span>JAV 封面</span>
+          <input type="text" id="javSavePath" placeholder="封面保存文件夹" />
+          <button type="button" class="mini" data-paste-for="javSavePath">粘贴</button>
+          <button type="button" class="mini" data-open-for="jav">打开</button>
+        </label>
+        <label class="row">
+          <span>YouTube 封面</span>
+          <input type="text" id="youtubeSavePath" placeholder="封面保存文件夹" />
+          <button type="button" class="mini" data-paste-for="youtubeSavePath">粘贴</button>
+          <button type="button" class="mini" data-open-for="youtube">打开</button>
+        </label>
+      </fieldset>
+
+      <fieldset class="group">
+        <legend>按钮图标路径</legend>
+        <label class="row"><span>粘贴</span><input type="text" id="iconPaste" /><button type="button" class="mini" data-paste-for="iconPaste">粘贴</button></label>
+        <label class="row"><span>搜索</span><input type="text" id="iconSearch" /><button type="button" class="mini" data-paste-for="iconSearch">粘贴</button></label>
+        <label class="row"><span>提纯代号</span><input type="text" id="iconExtractCode" /><button type="button" class="mini" data-paste-for="iconExtractCode">粘贴</button></label>
+        <label class="row"><span>JAV 目录</span><input type="text" id="iconOpenJav" /><button type="button" class="mini" data-paste-for="iconOpenJav">粘贴</button></label>
+        <label class="row"><span>YT 目录</span><input type="text" id="iconOpenYoutube" /><button type="button" class="mini" data-paste-for="iconOpenYoutube">粘贴</button></label>
+        <label class="row"><span>设置</span><input type="text" id="iconSettings" /><button type="button" class="mini" data-paste-for="iconSettings">粘贴</button></label>
+      </fieldset>
+
+      <div class="dialog-actions">
+        <button type="button" id="settingsCancel" class="secondary">取消</button>
+        <button type="submit" value="save" class="primary">保存</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="renderer.js"></script>
+</body>
+</html>
