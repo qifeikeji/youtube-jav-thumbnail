@@ -22,13 +22,21 @@ if (!process.versions || !process.versions.electron) {
 const { app, BrowserWindow, ipcMain, shell, clipboard, nativeImage, session, net } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const { spawnSync } = require('child_process');
 
 const LEGACY_CONFIG_FILE = path.join(__dirname, 'settings.json');
 
 const DEFAULT_CONFIG = {
   proxy: {
     http: { enabled: false, host: '127.0.0.1', port: 8080, url: '' },
-    socks5: { enabled: false, host: '127.0.0.1', port: 1080, url: '' }
+    socks5: {
+      enabled: false,
+      host: '127.0.0.1',
+      port: 1080,
+      url: '',
+      dnsMode: 'auto',
+      useCurlFallback: true
+    }
   },
   settingsJsonPath: '',
   javSavePath: '',
@@ -156,27 +164,74 @@ function configForRenderer() {
   };
 }
 
-function socksProxyRule(hostPort) {
-  return `socks5h=${hostPort}`;
+const PROXY_BYPASS_RULES =
+  '<local>;127.0.0.1;192.168.0.0/16;10.0.0.0/8;172.16.0.0/12;*.local';
+
+function socksDnsModesForEndpoint(ep) {
+  const mode = (ep && ep.dnsMode) || 'auto';
+  if (mode === 'local') return ['local'];
+  if (mode === 'remote') return ['remote'];
+  return ['remote', 'local'];
+}
+
+function socksProxyRule(hostPort, dnsKind) {
+  const prefix = dnsKind === 'local' ? 'socks5=' : 'socks5h=';
+  return `${prefix}${hostPort}`;
+}
+
+function resolveSocksConnectSpec(endpoint) {
+  const ep = endpoint || {};
+  const urlRaw = (ep.url || '').trim();
+  if (urlRaw) {
+    let normalized = urlRaw;
+    if (!/^socks/i.test(normalized)) {
+      normalized = `socks5://${normalized.replace(/^\/\//, '')}`;
+    }
+    try {
+      const parsed = new URL(normalized);
+      const host = parsed.hostname;
+      const port = parsed.port || '1080';
+      const user = parsed.username ? decodeURIComponent(parsed.username) : '';
+      const pass = parsed.password ? decodeURIComponent(parsed.password) : '';
+      return { host, port, user, pass };
+    } catch (_) {
+      /* fall through */
+    }
+  }
+  return {
+    host: ep.host || '127.0.0.1',
+    port: String(ep.port || 1080),
+    user: '',
+    pass: ''
+  };
 }
 
 function proxyRulesFromEndpoint(endpoint, kind) {
   const ep = endpoint || {};
   const urlRaw = (ep.url || '').trim();
-  if (urlRaw) {
-    const fromUrl = proxyRulesFromUrl(urlRaw);
+  if (urlRaw && kind !== 'socks5') {
+    const fromUrl = proxyRulesFromUrl(urlRaw, ep);
     if (fromUrl) return fromUrl;
+  }
+  if (kind === 'socks5' && urlRaw) {
+    const spec = resolveSocksConnectSpec(ep);
+    const hostPort = spec.user
+      ? `${spec.user}:${spec.pass}@${spec.host}:${spec.port}`
+      : `${spec.host}:${spec.port}`;
+    const [primary] = socksDnsModesForEndpoint(ep);
+    return socksProxyRule(hostPort, primary);
   }
   if (ep.enabled && ep.host) {
     const defaultPort = kind === 'http' ? 8080 : 1080;
     const hostPort = `${ep.host}:${ep.port || defaultPort}`;
     if (kind === 'socks5') {
-      return socksProxyRule(hostPort);
+      const [primary] = socksDnsModesForEndpoint(ep);
+      return socksProxyRule(hostPort, primary);
     }
     return `http=${hostPort};https=${hostPort}`;
   }
   if (ep.enabled && urlRaw) {
-    const fromUrl = proxyRulesFromUrl(urlRaw);
+    const fromUrl = proxyRulesFromUrl(urlRaw, ep);
     if (fromUrl) return fromUrl;
   }
   return '';
@@ -194,12 +249,13 @@ function proxyRulesString() {
 }
 
 /** 从完整代理 URL 生成 Chromium proxyRules */
-function proxyRulesFromUrl(urlStr) {
+function proxyRulesFromUrl(urlStr, endpoint) {
   let normalized = urlStr.trim();
   if (!normalized) return '';
   const socksDirect = normalized.match(/^socks5h?:\/\/(.+)$/i);
   if (socksDirect) {
-    return socksProxyRule(socksDirect[1].replace(/\/$/, ''));
+    const [primary] = socksDnsModesForEndpoint(endpoint || {});
+    return socksProxyRule(socksDirect[1].replace(/\/$/, ''), primary);
   }
   if (!/^[a-z][a-z0-9+.-]*:/i.test(normalized)) {
     normalized = `http://${normalized}`;
@@ -222,7 +278,8 @@ function proxyRulesFromUrl(urlStr) {
       hostPort = pass ? `${user}:${pass}@${hostPort}` : `${user}@${hostPort}`;
     }
     if (scheme === 'socks5' || scheme === 'socks5h') {
-      return socksProxyRule(hostPort);
+      const [primary] = socksDnsModesForEndpoint(endpoint || {});
+      return socksProxyRule(hostPort, primary);
     }
     if (scheme === 'socks4') {
       return `socks4=${hostPort}`;
@@ -303,7 +360,7 @@ async function applyProxyRulesToSession(sess, rules) {
     await sess.setProxy({
       mode: 'fixed_servers',
       proxyRules: rules,
-      proxyBypassRules: '<local>'
+      proxyBypassRules: PROXY_BYPASS_RULES
     });
   } else {
     await sess.setProxy({ mode: 'direct' });
@@ -317,26 +374,123 @@ async function applyProxyToSession(sess) {
   await applyProxyRulesToSession(sess, proxyRulesString());
 }
 
-async function fetchUrlBuffer(url, extraHeaders) {
+function fetchUrlBufferViaCurlOnce(url, endpoint, extraHeaders, dnsKind) {
+  const spec = resolveSocksConnectSpec(endpoint);
+  const flag = dnsKind === 'local' ? '--socks5' : '--socks5-hostname';
+  let proxyArg = `${spec.host}:${spec.port}`;
+  if (spec.user) {
+    proxyArg = `${spec.user}:${spec.pass}@${proxyArg}`;
+  }
+  const args = [
+    '-sS',
+    '-L',
+    '--max-time',
+    '45',
+    '-A',
+    NET_HEADERS['User-Agent'],
+    flag,
+    proxyArg
+  ];
+  if (extraHeaders && extraHeaders.Referer) {
+    args.push('-H', `Referer: ${extraHeaders.Referer}`);
+  }
+  args.push(url);
+  const result = spawnSync('curl', args, {
+    encoding: 'buffer',
+    maxBuffer: 64 * 1024 * 1024
+  });
+  if (result.error) {
+    if (result.error.code === 'ENOENT') {
+      throw new Error('未找到 curl，请安装 curl 或关闭「SOCKS 使用 curl」');
+    }
+    throw result.error;
+  }
+  if (result.status !== 0) {
+    const errText = (result.stderr && result.stderr.toString()) || `curl 退出码 ${result.status}`;
+    throw new Error(errText.trim());
+  }
+  if (!result.stdout || !result.stdout.length) {
+    throw new Error('curl 返回空内容');
+  }
+  return Buffer.from(result.stdout);
+}
+
+function fetchUrlBufferViaCurl(url, endpoint, extraHeaders) {
+  const modes = socksDnsModesForEndpoint(endpoint);
+  let lastErr;
+  for (const mode of modes) {
+    try {
+      return fetchUrlBufferViaCurlOnce(url, endpoint, extraHeaders, mode);
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error('curl SOCKS 请求失败');
+}
+
+async function fetchUrlBufferElectron(url, extraHeaders) {
   const sess = session.defaultSession;
   await applyProxyToSession(sess);
   const rules = proxyRulesString();
-  try {
-    return await fetchUrlBufferOnce(url, sess, extraHeaders);
-  } catch (firstErr) {
-    if (rules && rules.includes('socks5h=')) {
-      try {
-        const altRules = rules.replace(/socks5h=/g, 'socks5=');
-        await applyProxyRulesToSession(sess, altRules);
-        return await fetchUrlBufferOnce(url, sess, extraHeaders);
-      } catch (_) {
-        /* restore below */
-      } finally {
-        await applyProxyToSession(sess);
-      }
+  const p = normalizeProxyConfig(config.proxy);
+  const tryModes =
+    p.socks5.enabled && p.socks5.dnsMode === 'auto'
+      ? ['remote', 'local']
+      : [socksDnsModesForEndpoint(p.socks5)[0] || 'remote'];
+
+  let lastErr;
+  for (const dnsKind of p.socks5.enabled ? tryModes : ['remote']) {
+    if (p.socks5.enabled) {
+      const spec = resolveSocksConnectSpec(p.socks5);
+      const hostPort = spec.user
+        ? `${spec.user}:${spec.pass}@${spec.host}:${spec.port}`
+        : `${spec.host}:${spec.port}`;
+      const altRules = socksProxyRule(hostPort, dnsKind);
+      await applyProxyRulesToSession(sess, altRules);
     }
-    throw firstErr;
+    try {
+      return await fetchUrlBufferOnce(url, sess, extraHeaders);
+    } catch (e) {
+      lastErr = e;
+    }
   }
+
+  if (!p.socks5.enabled && rules && rules.includes('socks5h=')) {
+    try {
+      const altRules = rules.replace(/socks5h=/g, 'socks5=');
+      await applyProxyRulesToSession(sess, altRules);
+      return await fetchUrlBufferOnce(url, sess, extraHeaders);
+    } catch (e) {
+      lastErr = e;
+    } finally {
+      await applyProxyToSession(sess);
+    }
+  }
+
+  throw lastErr || new Error('网络请求失败');
+}
+
+async function fetchUrlBuffer(url, extraHeaders) {
+  const p = normalizeProxyConfig(config.proxy);
+  const errors = [];
+
+  if (p.socks5.enabled && p.socks5.useCurlFallback !== false) {
+    try {
+      return fetchUrlBufferViaCurl(url, p.socks5, extraHeaders);
+    } catch (e) {
+      errors.push(`curl: ${e.message}`);
+    }
+  }
+
+  try {
+    return await fetchUrlBufferElectron(url, extraHeaders);
+  } catch (e) {
+    errors.push(`Chromium: ${e.message}`);
+  } finally {
+    await applyProxyToSession(session.defaultSession);
+  }
+
+  throw new Error(errors.join('；') || '网络请求失败');
 }
 
 function getVideoId(url) {

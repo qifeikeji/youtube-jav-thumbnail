@@ -81,7 +81,19 @@
           </label>
           <label class="row">
             <span>或 URL</span>
-            <input type="text" id="proxySocks5Url" placeholder="socks5://127.0.0.1:1080（DNS 走代理，socks5h）" />
+            <input type="text" id="proxySocks5Url" placeholder="socks5://127.0.0.1:7891（端口以代理软件为准）" />
+          </label>
+          <label class="row">
+            <span>DNS</span>
+            <select id="proxySocks5Dns">
+              <option value="auto">自动（代理端 + 本地各试一次）</option>
+              <option value="remote">代理端解析 (socks5h)</option>
+              <option value="local">本地解析 (socks5)</option>
+            </select>
+          </label>
+          <label class="row-check">
+            <input type="checkbox" id="proxySocks5Curl" checked />
+            SOCKS 下载优先用 curl（与终端一致，推荐）
           </label>
         </fieldset>
       </fieldset>

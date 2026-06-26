@@ -81,6 +81,9 @@ function fillProxyForm(cfg) {
   $('proxySocks5Host').value = socks5.host || '127.0.0.1';
   $('proxySocks5Port').value = socks5.port ?? 1080;
   $('proxySocks5Url').value = socks5.url || '';
+  const dns = socks5.dnsMode || 'auto';
+  $('proxySocks5Dns').value = ['auto', 'remote', 'local'].includes(dns) ? dns : 'auto';
+  $('proxySocks5Curl').checked = socks5.useCurlFallback !== false;
 }
 
 function readProxyForm() {
@@ -95,7 +98,9 @@ function readProxyForm() {
       enabled: $('proxySocks5Enabled').checked,
       host: $('proxySocks5Host').value.trim(),
       port: parseInt($('proxySocks5Port').value, 10) || 1080,
-      url: $('proxySocks5Url').value.trim()
+      url: $('proxySocks5Url').value.trim(),
+      dnsMode: $('proxySocks5Dns').value || 'auto',
+      useCurlFallback: $('proxySocks5Curl').checked
     }
   };
 }
